@@ -10,6 +10,7 @@ from urdf_parser_py.urdf import URDF
 import random
 import tf
 from threading import Thread, Lock
+import time
 
 '''This is a class which will perform both cartesian control and inverse
    kinematics'''
@@ -65,8 +66,23 @@ class CCIK(object):
         self.mutex.acquire()
         #--------------------------------------------------------------------------
         #FILL IN YOUR PART OF THE CODE FOR CARTESIAN CONTROL HERE
-
-
+        translation = (command.x_target.translation.x,command.x_target.translation.y,command.x_target.translation.z)
+        rotation = command.x_target.rotation
+        quaternion = [rotation.x,rotation.y,rotation.z,rotation.w]
+        b_T_ee_desired = numpy.dot(tf.transformations.translation_matrix(translation), tf.transformations.quaternion_matrix(quaternion))
+        joint_transforms, b_T_ee_current = self.forward_kinematics(self.q_current)
+        T_ee = numpy.dot(tf.transformations.inverse_matrix(b_T_ee_current),b_T_ee_desired)
+        delta_x_translation = tf.transformations.translation_from_matrix(T_ee)
+        angle, axis = self.rotation_from_matrix(T_ee)
+        delta_x_rotation = angle * axis
+        delta_x = numpy.hstack((delta_x_translation,delta_x_rotation))
+        v_ee = delta_x * 1.0
+        J = self.get_jacobian(b_T_ee_current, joint_transforms)
+        J_pinv = numpy.linalg.pinv(J,0.01)
+        q_des = numpy.dot(J_pinv,v_ee)
+        self.joint_velocity_msg.name = self.joint_names
+        self.joint_velocity_msg.velocity = q_des
+        self.velocity_pub.publish(self.joint_velocity_msg)
         #--------------------------------------------------------------------------
         self.mutex.release()
 
@@ -79,8 +95,32 @@ class CCIK(object):
         J = numpy.zeros((6,self.num_joints))
         #--------------------------------------------------------------------------
         #FILL IN YOUR PART OF THE CODE FOR ASSEMBLING THE CURRENT JACOBIAN HERE
-
-
+        j_T_ees =[]
+        Vjs = []
+        for j_T_ee in joint_transforms:
+            j_T_ees.append(numpy.dot(tf.transformations.inverse_matrix(j_T_ee),b_T_ee))
+        for j_T_ee in j_T_ees:
+            R = numpy.array(j_T_ee, dtype=numpy.float64, copy=False)
+            j_R_ee = R[:3, :3]
+            ee_R_j = j_R_ee.T
+            j_t_ee = R[:3,-1]
+            S_j_t_ee = [[0,-j_t_ee[2],j_t_ee[1]], [j_t_ee[2],0,-j_t_ee[0]], [-j_t_ee[1],j_t_ee[0],0]]
+            Vj = numpy.zeros((6,6))
+            Vj[:3,:3] = ee_R_j
+            Vj[3:,3:] = ee_R_j
+            Vj[:3,3:] = - numpy.dot(ee_R_j,S_j_t_ee)
+            Vjs.append(Vj)
+        for i in range(self.num_joints):
+            axis = self.joint_axes[i]
+            if axis[0] == 1:
+                Vj = Vjs[i]
+                J[:,i] = Vj[:,3]
+            elif axis[1] == 1:
+                Vj = Vjs[i]
+                J[:,i] = Vj[:,4]
+            elif axis[2] == 1:
+                Vj = Vjs[i]
+                J[:,i] = Vj[:,5]
         #--------------------------------------------------------------------------
         return J
 
@@ -95,7 +135,37 @@ class CCIK(object):
         self.mutex.acquire()
         #--------------------------------------------------------------------------
         #FILL IN YOUR PART OF THE CODE FOR INVERSE KINEMATICS HERE
-
+        translation = (command.translation.x,command.translation.y,command.translation.z)
+        rotation = command.rotation
+        quaternion = [rotation.x,rotation.y,rotation.z,rotation.w]
+        x_d = numpy.dot(tf.transformations.translation_matrix(translation), tf.transformations.quaternion_matrix(quaternion))
+        t = 0
+        while t < 3:
+            q_c = [numpy.random.rand()] * self.num_joints
+            q_dot = [1] * self.num_joints
+            start = time.time()
+            while time.time() - start < 9:
+                joint_transforms, x_c = self.forward_kinematics(q_c)
+                T_ee = numpy.dot(tf.transformations.inverse_matrix(x_c),x_d)
+                delta_x_translation = tf.transformations.translation_from_matrix(T_ee)
+                angle, axis = self.rotation_from_matrix(T_ee)
+                delta_x_rotation = angle * axis
+                delta_x = numpy.hstack((delta_x_translation,delta_x_rotation))
+                x_dot = delta_x * 1.0
+                J = self.get_jacobian(x_c, joint_transforms)
+                J_pinv = numpy.linalg.pinv(J,0.01)
+                q_dot = numpy.dot(J_pinv,x_dot)
+                q_c += q_dot
+                if numpy.linalg.norm(q_dot) > 1e-8:
+                    break
+            if numpy.linalg.norm(q_dot) > 1e-8:
+                break
+            else:
+                t += 1
+        if t != 3 :
+            self.joint_command_msg.name = self.joint_names
+            self.joint_command_msg.position = q_c
+            self.joint_command_pub.publish(self.joint_command_msg)
 
         #--------------------------------------------------------------------------
         self.mutex.release()
